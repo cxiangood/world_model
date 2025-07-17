@@ -14,6 +14,24 @@ IMAGE_SIZE = (64, 64)
 FPS = 10
 
 class CarlaLaneKeepingServer:
+    def _follow_vehicle(self):
+        import math
+        try:
+            spectator = self.world.get_spectator()
+            transform = self.vehicle.get_transform()
+            yaw = math.radians(transform.rotation.yaw)
+            dx = 8 * math.cos(yaw)
+            dy = 8 * math.sin(yaw)
+            cam_location = transform.location + carla.Location(x=dx, y=dy, z=2)
+            cam_rotation = carla.Rotation(pitch=0, yaw=transform.rotation.yaw)
+            spectator.set_transform(carla.Transform(cam_location, cam_rotation))
+            print(f"[Carla0915] Spectator set to {cam_location} {cam_rotation}")
+        except Exception as e:
+            print(f"[Carla0915] Spectator follow failed: {e}")
+    def _init_stuck_detector(self):
+        self._stuck_steps = 0
+        self._last_location = None
+
     def __init__(self, host, port):
         self.host = host
         self.port = port
@@ -26,6 +44,7 @@ class CarlaLaneKeepingServer:
         self.last_image = None
         self.done = True
         self._connect_to_carla()
+        self._init_stuck_detector()
         print(f"[Carla0915] Server started at {host}:{port}")
 
     def _connect_to_carla(self):
@@ -39,12 +58,7 @@ class CarlaLaneKeepingServer:
         spawn_point = self.world.get_map().get_spawn_points()[0]
         self.vehicle = self.world.try_spawn_actor(vehicle_bp, spawn_point)
         self.vehicle.set_autopilot(False)
-        spectator = self.world.get_spectator()
-        transform = self.vehicle.get_transform()
-        back_vec = carla.Location(x=-8, y=0)
-        cam_location = transform.location + back_vec + carla.Location(z=8)
-        cam_rotation = carla.Rotation(pitch=-60, yaw=transform.rotation.yaw)
-        spectator.set_transform(carla.Transform(cam_location, cam_rotation))
+        self._follow_vehicle()
 
     def _setup_camera(self):
         camera_bp = self.blueprint_library.find('sensor.camera.rgb')
@@ -69,6 +83,7 @@ class CarlaLaneKeepingServer:
         self._spawn_vehicle()
         self._setup_camera()
         self.done = False
+        self._init_stuck_detector()
         time.sleep(0.2)
         return self._get_obs()
 
@@ -83,16 +98,50 @@ class CarlaLaneKeepingServer:
         control.brake = brake
         self.vehicle.apply_control(control)
         self.world.tick()
+        # 卡死检测
+        obs = self._get_obs()
+        speed = obs['speed']
+        loc = self.vehicle.get_location()
+        if self._last_location is not None:
+            dist = loc.distance(self._last_location)
+        else:
+            dist = 0
+        self._last_location = loc
+        if speed < 0.1 and dist < 0.05:
+            self._stuck_steps += 1
+        else:
+            self._stuck_steps = 0
+        if self._stuck_steps > 10:
+            print('[Carla0915] Vehicle stuck, force done=True')
+            self.done = True
+        else:
+            self.done = False
+        obs['done'] = self.done
         time.sleep(1.0 / FPS)
-        return self._get_obs()
+        return obs
 
     def _get_obs(self):
         image = self.last_image if self.last_image is not None else [[0]*3]*IMAGE_SIZE[0]*IMAGE_SIZE[1]
         velocity = self.vehicle.get_velocity()
         speed = float(np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2))
+        # 真实 lane_offset：车辆到最近车道中心线的横向距离
+        try:
+            veh_loc = self.vehicle.get_location()
+            waypoint = self.world.get_map().get_waypoint(veh_loc, project_to_road=True, lane_type=carla.LaneType.Driving)
+            lane_center = waypoint.transform.location
+            lane_offset = veh_loc.distance(lane_center)
+            right_vec = waypoint.transform.get_right_vector()
+            rel_vec = veh_loc - lane_center
+            sign = np.sign(right_vec.x * rel_vec.x + right_vec.y * rel_vec.y + right_vec.z * rel_vec.z)
+            lane_offset *= sign
+            print(f"[Carla0915] lane_offset: {lane_offset:.3f} m (veh: {veh_loc}, center: {lane_center})")
+        except Exception as e:
+            print(f"[Carla0915] lane_offset calc failed: {e}")
+            lane_offset = 0.0
         obs = {
             'image': image,
             'speed': speed,
+            'lane_offset': lane_offset,
             'done': self.done
         }
         return obs
